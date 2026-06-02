@@ -1,9 +1,9 @@
 {
   "id": "dynamic-graphs",
   "name": "Dynamic Graphs",
-  "version": "1.0.0",
+  "version": "1.6.0",
   "minAppVersion": "1.4.0",
-  "description": "Frontmatter-driven animations of your notes over time: timeline sweep, bucket growth, graph timelapse, and cumulative line.",
+  "description": "Metadata-driven animations of your notes over time: timeline sweep, group growth, graph timelapse, and cumulative line. Configurable date/label/group mapping (tags or frontmatter).",
   "author": "Jason Ostanek",
   "isDesktopOnly": false
 }

@@ -2,35 +2,93 @@
 
 /*
  * Dynamic Graphs — a zero-dependency Obsidian plugin.
- * One view, four frontmatter-driven animation modes:
+ * One view, four metadata-driven animation modes:
  *   - Timeline sweep
- *   - Bucket growth
+ *   - Group growth
  *   - Graph timelapse
  *   - Cumulative line
  *
- * Reads per-note frontmatter (date_added, year, short_title, buckets) and the
- * links under a "## References" heading. Renders on a <canvas>; no build step,
- * no npm — drop main.js + manifest.json into a plugin folder.
+ * What drives each axis is configurable in settings (gear): the date property,
+ * the label property, and whether grouping/color comes from Obsidian tags or a
+ * named frontmatter property. Edges come from links (optionally only those under
+ * a "References"-style heading). Renders on a <canvas>; no build step, no npm.
  */
 
 const obsidian = require('obsidian');
-const { Plugin, ItemView, Notice } = obsidian;
+const { Plugin, ItemView, Notice, PluginSettingTab, Setting, getAllTags } = obsidian;
 
 const VIEW_TYPE = 'dynamic-graphs-view';
 
 const MODES = [
   { id: 'timeline', label: 'Timeline sweep' },
-  { id: 'buckets', label: 'Bucket growth' },
+  { id: 'groups', label: 'Group growth' },
   { id: 'graph', label: 'Graph timelapse' },
   { id: 'cumulative', label: 'Cumulative line' },
 ];
 
-// Distinct, theme-agnostic palette for buckets.
-const PALETTE = [
-  '#4e79a7', '#f28e2b', '#59a14f', '#e15759', '#b07aa1',
-  '#76b7b2', '#edc948', '#ff9da7', '#9c755f', '#bab0ac',
-  '#6a8cc7', '#d4a017', '#52b788', '#c44e52',
-];
+const DEFAULT_SETTINGS = {
+  defaultMode: 'timeline',
+  dateProp: 'date_added', // frontmatter key parsed as the timeline date
+  yearProp: 'year', // year property (e.g. publication year)
+  timeAxis: 'date', // 'date' (use dateProp) | 'year' (use yearProp)
+  labelProp: 'short_title', // node label; falls back to file basename
+  groupSource: 'property', // 'tags' (Obsidian tags) | 'property' (a frontmatter list)
+  groupProp: 'buckets', // frontmatter property used when groupSource === 'property'
+  folderScope: '', // '' = whole vault; otherwise limit to this folder
+  edgeSource: 'references', // 'references' (links under the heading) | 'all' (all outgoing links)
+  refHeading: 'References', // heading whose section supplies edges
+  showGroupNodes: true, // synthesize a hub node per group in the graph mode
+  durationSec: 8, // seconds for one full sweep (toolbar slow↔fast slider, 2–15)
+  fontSize: 14, // size (px) for axis/chart labels and the hover tooltip
+  graphFontSize: 14, // size (px) for node labels drawn inside the graph mode
+  colorScheme: 'tableau', // group color palette (key of PALETTES)
+};
+
+const FONT_MIN = 8;
+const FONT_MAX = 32;
+
+// Distinct, theme-agnostic palettes for group color.
+const PALETTES = {
+  tableau: [
+    '#4e79a7', '#f28e2b', '#59a14f', '#e15759', '#b07aa1',
+    '#76b7b2', '#edc948', '#ff9da7', '#9c755f', '#bab0ac',
+    '#6a8cc7', '#d4a017', '#52b788', '#c44e52',
+  ],
+  set2: [
+    '#66c2a5', '#fc8d62', '#8da0cb', '#e78ac3', '#a6d854',
+    '#ffd92f', '#e5c494', '#b3b3b3',
+  ],
+  bold: [
+    '#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00',
+    '#a65628', '#f781bf', '#999999', '#dede00',
+  ],
+  warm: [
+    '#7f0000', '#b30000', '#d7301f', '#ef6548', '#fc8d59',
+    '#fdbb84', '#fdd49e', '#fee8c8',
+  ],
+  cool: [
+    '#084594', '#2171b5', '#4292c6', '#6baed6', '#9ecae1',
+    '#756bb1', '#9e9ac8', '#bcbddc',
+  ],
+  viridis: [
+    '#440154', '#472d7b', '#3b528b', '#2c728e', '#21918c',
+    '#28ae80', '#5ec962', '#addc30', '#fde725',
+  ],
+  rainbow: [
+    '#e6194b', '#f58231', '#ffe119', '#3cb44b', '#42d4f4',
+    '#4363d8', '#911eb4', '#f032e6', '#469990', '#9a6324',
+  ],
+};
+
+const PALETTE_LABELS = {
+  tableau: 'Tableau (default)',
+  set2: 'Soft / pastel',
+  bold: 'Bold',
+  warm: 'Warm',
+  cool: 'Cool',
+  viridis: 'Viridis',
+  rainbow: 'Rainbow',
+};
 
 // ---------------------------------------------------------------------------
 // Helpers (pure)
@@ -40,9 +98,8 @@ function parseDate(v) {
   if (v == null) return null;
   if (v instanceof Date) return v.getTime();
   if (typeof v === 'number') {
-    // Bare number: treat as a year if plausible, else epoch ms.
-    if (v > 1000 && v < 3000) return Date.UTC(v, 0, 1);
-    return v;
+    if (v > 1000 && v < 3000) return Date.UTC(v, 0, 1); // bare plausible year
+    return v; // epoch ms
   }
   const s = String(v).trim();
   if (!s) return null;
@@ -57,7 +114,7 @@ function parseYear(v) {
   return isNaN(n) ? null : n;
 }
 
-function normBuckets(v) {
+function normList(v) {
   if (v == null) return [];
   if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean);
   return String(v)
@@ -84,25 +141,40 @@ function smoothstep(edge0, edge1, x) {
   return t * t * (3 - 2 * t);
 }
 
+const GROUP_PREFIX = 'group::';
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
 
 module.exports = class DynamicGraphsPlugin extends Plugin {
   async onload() {
+    await this.loadSettings();
+
     this.registerView(VIEW_TYPE, (leaf) => new DynamicGraphsView(leaf, this));
-
     this.addRibbonIcon('line-chart', 'Open Dynamic Graphs', () => this.activateView());
-
     this.addCommand({
       id: 'open-dynamic-graphs',
       name: 'Open Dynamic Graphs view',
       callback: () => this.activateView(),
     });
+    this.addSettingTab(new DynamicGraphsSettingTab(this.app, this));
   }
 
-  async onunload() {
-    // Leaves are detached automatically; views clean up their own RAF in onClose.
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+  }
+
+  async saveSettings(reload) {
+    await this.saveData(this.settings);
+    if (reload) this.refreshViews();
+  }
+
+  refreshViews() {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
+      const v = leaf.view;
+      if (v && typeof v.reloadData === 'function') v.reloadData();
+    }
   }
 
   async activateView() {
@@ -117,6 +189,164 @@ module.exports = class DynamicGraphsPlugin extends Plugin {
 };
 
 // ---------------------------------------------------------------------------
+// Settings tab (the gear)
+// ---------------------------------------------------------------------------
+
+class DynamicGraphsSettingTab extends PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display() {
+    const { containerEl } = this;
+    containerEl.empty();
+    const s = this.plugin.settings;
+    const save = (reload) => this.plugin.saveSettings(reload);
+
+    new Setting(containerEl).setName('Display').setHeading();
+
+    new Setting(containerEl)
+      .setName('Default mode')
+      .setDesc('Which animation opens first. You can still switch modes in the toolbar.')
+      .addDropdown((d) => {
+        for (const m of MODES) d.addOption(m.id, m.label);
+        d.setValue(s.defaultMode).onChange((v) => {
+          s.defaultMode = v;
+          save(false);
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('Group color scheme')
+      .setDesc('Palette used to color groups across all four modes.')
+      .addDropdown((d) => {
+        for (const key of Object.keys(PALETTE_LABELS)) d.addOption(key, PALETTE_LABELS[key]);
+        d.setValue(s.colorScheme).onChange((v) => {
+          s.colorScheme = v;
+          save(true);
+        });
+      });
+
+    new Setting(containerEl).setName('Data mapping').setHeading();
+
+    new Setting(containerEl)
+      .setName('Date property')
+      .setDesc('Frontmatter key parsed as the timeline date (any date string, or a Date).')
+      .addText((t) =>
+        t.setPlaceholder('date_added').setValue(s.dateProp).onChange((v) => {
+          s.dateProp = v.trim() || DEFAULT_SETTINGS.dateProp;
+          save(true);
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('Year property')
+      .setDesc('Year metadata, e.g. publication year (mapped to Jan 1).')
+      .addText((t) =>
+        t.setPlaceholder('year').setValue(s.yearProp).onChange((v) => {
+          s.yearProp = v.trim();
+          save(true);
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('Timeline x-axis')
+      .setDesc('Which property positions notes in time (all modes). The other is used as a fallback when the chosen one is missing.')
+      .addDropdown((d) => {
+        d.addOption('date', 'Date property');
+        d.addOption('year', 'Year property');
+        d.setValue(s.timeAxis).onChange((v) => {
+          s.timeAxis = v;
+          save(true);
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('Label property')
+      .setDesc('Frontmatter key for a note’s label. Falls back to the file name.')
+      .addText((t) =>
+        t.setPlaceholder('short_title').setValue(s.labelProp).onChange((v) => {
+          s.labelProp = v.trim();
+          save(true);
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('Group by')
+      .setDesc('What drives grouping and color across all four modes.')
+      .addDropdown((d) => {
+        d.addOption('tags', 'Obsidian tags');
+        d.addOption('property', 'Frontmatter property');
+        d.setValue(s.groupSource).onChange((v) => {
+          s.groupSource = v;
+          save(true);
+          this.display(); // toggle visibility of the property field
+        });
+      });
+
+    if (s.groupSource === 'property') {
+      new Setting(containerEl)
+        .setName('Group property')
+        .setDesc('Frontmatter list (or comma string) whose values are the groups.')
+        .addText((t) =>
+          t.setPlaceholder('buckets').setValue(s.groupProp).onChange((v) => {
+            s.groupProp = v.trim() || DEFAULT_SETTINGS.groupProp;
+            save(true);
+          })
+        );
+    }
+
+    new Setting(containerEl)
+      .setName('Folder scope')
+      .setDesc('Limit to a folder (e.g. Papers). Leave blank for the whole vault.')
+      .addText((t) =>
+        t.setPlaceholder('(whole vault)').setValue(s.folderScope).onChange((v) => {
+          s.folderScope = v.trim().replace(/\/+$/, '');
+          save(true);
+        })
+      );
+
+    new Setting(containerEl).setName('Graph edges').setHeading();
+
+    new Setting(containerEl)
+      .setName('Edge source')
+      .setDesc('Which outgoing links become edges.')
+      .addDropdown((d) => {
+        d.addOption('references', 'Only links under a heading');
+        d.addOption('all', 'All outgoing links');
+        d.setValue(s.edgeSource).onChange((v) => {
+          s.edgeSource = v;
+          save(true);
+          this.display();
+        });
+      });
+
+    if (s.edgeSource === 'references') {
+      new Setting(containerEl)
+        .setName('Edge heading')
+        .setDesc('Edges come only from links at/after this heading (case-insensitive, substring).')
+        .addText((t) =>
+          t.setPlaceholder('References').setValue(s.refHeading).onChange((v) => {
+            s.refHeading = v.trim() || DEFAULT_SETTINGS.refHeading;
+            save(true);
+          })
+        );
+    }
+
+    new Setting(containerEl)
+      .setName('Show group hub nodes')
+      .setDesc('In the graph, add one labeled hub node per group and link its members to it.')
+      .addToggle((t) =>
+        t.setValue(s.showGroupNodes).onChange((v) => {
+          s.showGroupNodes = v;
+          save(true);
+        })
+      );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // View
 // ---------------------------------------------------------------------------
 
@@ -124,10 +354,11 @@ class DynamicGraphsView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.plugin = plugin;
-    this.mode = 'timeline';
+    this.mode = plugin.settings.defaultMode;
     this.playing = false;
-    this.speed = 1;
-    this.durationSec = 16; // base wall-clock seconds for one full sweep at 1x
+    this.durationSec = plugin.settings.durationSec;
+    this.fontSize = plugin.settings.fontSize;
+    this.graphFontSize = plugin.settings.graphFontSize;
     this.t = 0;
     this.tMin = 0;
     this.tMax = 1;
@@ -135,7 +366,6 @@ class DynamicGraphsView extends ItemView {
     this.lastNow = 0;
     this.raf = null;
     this.data = null;
-    this.hover = null; // {node, x, y} in graph mode
     this.frame = this.frame.bind(this);
   }
 
@@ -159,7 +389,6 @@ class DynamicGraphsView extends ItemView {
 
     this.buildControls(root);
 
-    // Canvas area
     const canvasWrap = root.createDiv();
     canvasWrap.style.position = 'relative';
     canvasWrap.style.flex = '1 1 auto';
@@ -180,7 +409,7 @@ class DynamicGraphsView extends ItemView {
       border: '1px solid var(--background-modifier-border)',
       borderRadius: '4px',
       padding: '2px 6px',
-      fontSize: '12px',
+      fontSize: this.fontSize + 'px',
       color: 'var(--text-normal)',
       display: 'none',
       whiteSpace: 'nowrap',
@@ -189,7 +418,6 @@ class DynamicGraphsView extends ItemView {
 
     this.registerDomEvent(this.canvas, 'mousemove', (e) => this.onMouseMove(e));
     this.registerDomEvent(this.canvas, 'mouseleave', () => {
-      this.hover = null;
       this.tooltip.style.display = 'none';
     });
     this.registerDomEvent(this.canvas, 'click', (e) => this.onClick(e));
@@ -197,7 +425,6 @@ class DynamicGraphsView extends ItemView {
     this.ro = new ResizeObserver(() => this.resize());
     this.ro.observe(canvasWrap);
 
-    // Rebuild data when metadata changes (debounced).
     this.registerEvent(
       this.plugin.app.metadataCache.on('resolved', () => this.scheduleReload())
     );
@@ -214,6 +441,16 @@ class DynamicGraphsView extends ItemView {
     if (this.reloadTimer) clearTimeout(this.reloadTimer);
   }
 
+  // Called by the plugin when settings change.
+  reloadData() {
+    this.durationSec = this.plugin.settings.durationSec;
+    this.fontSize = this.plugin.settings.fontSize;
+    this.graphFontSize = this.plugin.settings.graphFontSize;
+    if (this.tooltip) this.tooltip.style.fontSize = this.fontSize + 'px';
+    if (this.schemeSel) this.schemeSel.value = this.plugin.settings.colorScheme;
+    this.loadData();
+  }
+
   // --- Controls -----------------------------------------------------------
 
   buildControls(root) {
@@ -227,7 +464,6 @@ class DynamicGraphsView extends ItemView {
       borderBottom: '1px solid var(--background-modifier-border)',
     });
 
-    // Mode selector
     const modeSel = bar.createEl('select');
     modeSel.addClass('dropdown');
     for (const m of MODES) {
@@ -238,8 +474,8 @@ class DynamicGraphsView extends ItemView {
     modeSel.onchange = () => {
       this.mode = modeSel.value;
     };
+    this.modeSel = modeSel;
 
-    // Restart
     const restartBtn = bar.createEl('button', { text: '⏮' });
     restartBtn.title = 'Restart';
     restartBtn.onclick = () => {
@@ -247,61 +483,134 @@ class DynamicGraphsView extends ItemView {
       this.syncScrubber();
     };
 
-    // Play / pause
     const playBtn = bar.createEl('button', { text: '▶' });
     playBtn.title = 'Play / pause';
     this.playBtn = playBtn;
     playBtn.onclick = () => this.togglePlay();
 
-    // Scrubber
     const scrub = bar.createEl('input');
     scrub.type = 'range';
     scrub.min = '0';
     scrub.max = '1000';
     scrub.value = '0';
-    scrub.style.flex = '1 1 160px';
+    scrub.style.flex = '0 1 220px';
     this.scrub = scrub;
     scrub.oninput = () => {
       const f = parseInt(scrub.value, 10) / 1000;
       this.t = this.tMin + f * this.range;
     };
 
-    // Date readout
     const dateLbl = bar.createEl('span');
     dateLbl.style.fontVariantNumeric = 'tabular-nums';
     dateLbl.style.minWidth = '92px';
     dateLbl.style.color = 'var(--text-muted)';
     this.dateLbl = dateLbl;
 
-    // Speed
     const speedWrap = bar.createDiv();
     speedWrap.style.display = 'flex';
     speedWrap.style.alignItems = 'center';
     speedWrap.style.gap = '4px';
-    speedWrap.createEl('span', { text: 'speed' }).style.color = 'var(--text-muted)';
+    speedWrap.createEl('span', { text: 'slow' }).style.color = 'var(--text-muted)';
     const speed = speedWrap.createEl('input');
     speed.type = 'range';
-    speed.min = '0.25';
-    speed.max = '4';
-    speed.step = '0.25';
-    speed.value = '1';
-    speed.style.width = '90px';
+    speed.min = '2';
+    speed.max = '15';
+    speed.step = '1';
+    // Runs slow→fast left-to-right; slider value maps to seconds as (17 - value).
+    this.durationSec = clamp(this.durationSec, 2, 15);
+    speed.value = String(17 - this.durationSec);
+    speed.style.width = '110px';
+    speed.title = 'Animation speed (2–15 s per sweep)';
     speed.oninput = () => {
-      this.speed = parseFloat(speed.value);
+      this.durationSec = 17 - parseInt(speed.value, 10);
+      this.plugin.settings.durationSec = this.durationSec;
+      this.plugin.saveSettings(false);
     };
+    speedWrap.createEl('span', { text: 'fast' }).style.color = 'var(--text-muted)';
 
-    // Reload
+    // Font-size controls (live; persisted but not in the settings tab).
+    const fontWrap = bar.createDiv();
+    fontWrap.style.display = 'flex';
+    fontWrap.style.alignItems = 'center';
+    fontWrap.style.gap = '4px';
+    const mkFontInput = (label, get, set, title) => {
+      fontWrap.createEl('span', { text: label }).style.color = 'var(--text-muted)';
+      const inp = fontWrap.createEl('input');
+      inp.type = 'range';
+      inp.min = String(FONT_MIN);
+      inp.max = String(FONT_MAX);
+      inp.step = '1';
+      inp.value = String(get());
+      inp.style.width = '84px';
+      inp.title = title;
+      const val = fontWrap.createEl('span', { text: String(get()) });
+      val.style.color = 'var(--text-muted)';
+      val.style.minWidth = '18px';
+      val.style.fontVariantNumeric = 'tabular-nums';
+      inp.oninput = () => {
+        let v = parseInt(inp.value, 10);
+        if (isNaN(v)) return;
+        v = clamp(v, FONT_MIN, FONT_MAX);
+        set(v);
+        val.setText(String(v));
+        this.plugin.saveSettings(false);
+      };
+    };
+    mkFontInput(
+      'label',
+      () => this.plugin.settings.fontSize,
+      (v) => {
+        this.plugin.settings.fontSize = v;
+        this.fontSize = v;
+        if (this.tooltip) this.tooltip.style.fontSize = v + 'px';
+      },
+      'Axis, chart & tooltip label size (px)'
+    );
+    mkFontInput(
+      'node',
+      () => this.plugin.settings.graphFontSize,
+      (v) => {
+        this.plugin.settings.graphFontSize = v;
+        this.graphFontSize = v;
+      },
+      'Graph node label size (px)'
+    );
+
+    const schemeSel = bar.createEl('select');
+    schemeSel.addClass('dropdown');
+    for (const key of Object.keys(PALETTE_LABELS)) {
+      const o = schemeSel.createEl('option', { text: PALETTE_LABELS[key] });
+      o.value = key;
+    }
+    schemeSel.value = this.plugin.settings.colorScheme;
+    schemeSel.title = 'Group color scheme';
+    schemeSel.onchange = () => {
+      this.plugin.settings.colorScheme = schemeSel.value;
+      this.plugin.saveSettings(true);
+    };
+    this.schemeSel = schemeSel;
+
     const reloadBtn = bar.createEl('button', { text: '⟳' });
     reloadBtn.title = 'Reload data from vault';
     reloadBtn.onclick = () => {
       this.loadData();
       new Notice(`Dynamic Graphs: ${this.data.nodes.length} notes, ${this.data.edges.length} links`);
     };
+
+    const gear = bar.createEl('button', { text: '⚙' });
+    gear.title = 'Settings';
+    gear.onclick = () => {
+      const app = this.plugin.app;
+      if (app.setting) {
+        app.setting.open();
+        app.setting.openTabById(this.plugin.manifest.id);
+      }
+    };
   }
 
   togglePlay() {
     if (!this.data || this.range <= 0) return;
-    if (!this.playing && this.t >= this.tMax) this.t = this.tMin; // replay from start
+    if (!this.playing && this.t >= this.tMax) this.t = this.tMin;
     this.playing = !this.playing;
     this.playBtn.setText(this.playing ? '⏸' : '▶');
   }
@@ -319,147 +628,169 @@ class DynamicGraphsView extends ItemView {
 
   // --- Data ---------------------------------------------------------------
 
+  groupsFor(file, cache, fm) {
+    const s = this.plugin.settings;
+    if (s.groupSource === 'tags') {
+      const tags = getAllTags(cache) || [];
+      return Array.from(new Set(tags.map((t) => t.replace(/^#/, '')))).filter(Boolean);
+    }
+    return normList(fm[s.groupProp]);
+  }
+
   loadData() {
+    const s = this.plugin.settings;
     const app = this.plugin.app;
     const mc = app.metadataCache;
-    const files = app.vault.getMarkdownFiles();
 
-    const bucketSet = new Set();
-    const bucketStubPath = new Map(); // bucket name -> file path
-    for (const f of files) {
-      if (f.path.startsWith('Buckets/')) {
-        bucketSet.add(f.basename);
-        bucketStubPath.set(f.basename, f.path);
-      }
+    let files = app.vault.getMarkdownFiles();
+    if (s.folderScope) {
+      const scope = s.folderScope;
+      files = files.filter((f) => f.path === scope || f.path.startsWith(scope + '/'));
     }
 
-    const nodes = [];
-    const idx = new Map(); // path -> node index
+    const fileNodes = [];
+    const idx = new Map(); // path -> index into fileNodes
+    const groupSet = new Set();
+
     for (const f of files) {
       const cache = mc.getFileCache(f) || {};
       const fm = cache.frontmatter || {};
-      const isBucket = f.path.startsWith('Buckets/');
-      const buckets = normBuckets(fm.buckets);
-      for (const b of buckets) bucketSet.add(b);
 
-      let date = parseDate(fm.date_added);
-      const year = parseYear(fm.year);
-      if (date == null && year != null) date = Date.UTC(year, 0, 1);
+      const year = s.yearProp ? parseYear(fm[s.yearProp]) : null;
+      let date;
+      if (s.timeAxis === 'year') {
+        // Year is the axis; fall back to the date property if year is missing.
+        date = year != null ? Date.UTC(year, 0, 1) : parseDate(fm[s.dateProp]);
+      } else {
+        // Date is the axis; fall back to the year (-> Jan 1) if the date is missing.
+        date = parseDate(fm[s.dateProp]);
+        if (date == null && year != null) date = Date.UTC(year, 0, 1);
+      }
+      if (date == null) continue; // can't place undated notes in time
 
-      const node = {
+      const groups = this.groupsFor(f, cache, fm);
+      for (const g of groups) groupSet.add(g);
+
+      const labelVal = s.labelProp && fm[s.labelProp];
+      idx.set(f.path, fileNodes.length);
+      fileNodes.push({
         id: f.path,
         file: f,
-        basename: f.basename,
-        title: (fm.short_title && String(fm.short_title)) || f.basename,
+        title: (labelVal && String(labelVal)) || f.basename,
         year,
-        date, // may be null (resolved below for buckets / skipped for papers)
-        buckets,
-        isBucket,
-        // layout state (graph mode)
-        x: 0, y: 0, vx: 0, vy: 0, placed: false,
-      };
-      idx.set(f.path, nodes.length);
-      nodes.push(node);
+        date,
+        groups,
+        isGroup: false,
+        x: 0, y: 0, vx: 0, vy: 0,
+      });
     }
 
-    // Build edges: links under a "## References" heading (or all links if none),
-    // plus paper -> bucket-stub edges from frontmatter.
+    // Edges between file nodes.
     const edges = [];
-    const seenEdge = new Set();
+    const seen = new Set();
     const addEdge = (a, b) => {
       if (a === b) return;
       const key = a < b ? a + '|' + b : b + '|' + a;
-      if (seenEdge.has(key)) return;
-      seenEdge.add(key);
+      if (seen.has(key)) return;
+      seen.add(key);
       edges.push({ s: a, t: b });
     };
 
     for (const f of files) {
+      if (!idx.has(f.path)) continue;
       const cache = mc.getFileCache(f);
       if (!cache) continue;
       const links = cache.links || [];
-      const headings = cache.headings || [];
-      let refLine = -1;
-      for (const h of headings) {
-        if (/references/i.test(h.heading)) {
-          refLine = h.position.start.line;
-          break;
+      let useLinks;
+      if (s.edgeSource === 'all') {
+        useLinks = links;
+      } else {
+        const headings = cache.headings || [];
+        const needle = s.refHeading.toLowerCase();
+        let refLine = -1;
+        for (const h of headings) {
+          if (h.heading.toLowerCase().includes(needle)) {
+            refLine = h.position.start.line;
+            break;
+          }
         }
+        useLinks = refLine < 0 ? [] : links.filter((l) => l.position.start.line >= refLine);
       }
-      for (const lk of links) {
-        if (refLine >= 0 && lk.position.start.line < refLine) continue;
+      for (const lk of useLinks) {
         const target = lk.link.split('#')[0].split('|')[0];
         const dest = mc.getFirstLinkpathDest(target, f.path);
         if (dest && idx.has(dest.path)) addEdge(f.path, dest.path);
       }
-      // Frontmatter buckets -> stub nodes
-      const fm = cache.frontmatter || {};
-      for (const b of normBuckets(fm.buckets)) {
-        const stub = bucketStubPath.get(b);
-        if (stub) addEdge(f.path, stub);
+    }
+
+    // Time range over the file nodes.
+    let gMin, gMax;
+    if (fileNodes.length) {
+      gMin = Math.min(...fileNodes.map((n) => n.date));
+      gMax = Math.max(...fileNodes.map((n) => n.date));
+    } else {
+      gMin = Date.UTC(2000, 0, 1);
+      gMax = Date.UTC(2001, 0, 1);
+    }
+    if (gMax <= gMin) gMax = gMin + 86400000;
+
+    const groups = Array.from(groupSet).sort();
+    const palette = PALETTES[s.colorScheme] || PALETTES.tableau;
+    const groupColor = new Map();
+    groups.forEach((g, i) => groupColor.set(g, palette[i % palette.length]));
+
+    // Optional synthetic group hub nodes (graph mode).
+    const groupNodes = [];
+    if (s.showGroupNodes) {
+      for (const g of groups) {
+        const members = fileNodes.filter((n) => n.groups.includes(g));
+        if (!members.length) continue;
+        const date = Math.min(...members.map((n) => n.date));
+        groupNodes.push({
+          id: GROUP_PREFIX + g,
+          file: null,
+          title: g,
+          year: null,
+          date,
+          groups: [g],
+          isGroup: true,
+          x: 0, y: 0, vx: 0, vy: 0,
+        });
       }
     }
 
-    // Resolve bucket-stub appearance time: earliest connected paper.
-    const dated = nodes.filter((n) => n.date != null);
-    let gMin = dated.length ? Math.min(...dated.map((n) => n.date)) : Date.UTC(2000, 0, 1);
-    let gMax = dated.length ? Math.max(...dated.map((n) => n.date)) : Date.UTC(2001, 0, 1);
+    const allNodes = fileNodes.concat(groupNodes);
+    const allIdx = new Map(allNodes.map((n, i) => [n.id, i]));
 
-    const earliestForStub = new Map();
-    for (const e of edges) {
-      const a = nodes[idx.get(e.s)];
-      const b = nodes[idx.get(e.t)];
-      for (const [stub, other] of [[a, b], [b, a]]) {
-        if (stub.isBucket && other.date != null) {
-          const cur = earliestForStub.get(stub.id);
-          if (cur == null || other.date < cur) earliestForStub.set(stub.id, other.date);
+    // Member -> hub edges.
+    if (s.showGroupNodes) {
+      for (const gn of groupNodes) {
+        const g = gn.title;
+        for (const n of fileNodes) {
+          if (n.groups.includes(g)) addEdge(n.id, gn.id);
         }
       }
     }
-    for (const n of nodes) {
-      if (n.isBucket && n.date == null) {
-        n.date = earliestForStub.has(n.id) ? earliestForStub.get(n.id) : gMin;
-      }
-    }
-
-    // Drop undated, non-bucket nodes (can't be placed in time).
-    const keep = nodes.filter((n) => n.date != null);
-    const keepIds = new Set(keep.map((n) => n.id));
-    const keepEdges = edges.filter((e) => keepIds.has(e.s) && keepIds.has(e.t));
-
-    // Recompute time range over kept nodes.
-    if (keep.length) {
-      gMin = Math.min(...keep.map((n) => n.date));
-      gMax = Math.max(...keep.map((n) => n.date));
-    }
-    if (gMax <= gMin) gMax = gMin + 86400000; // avoid zero range
-
-    // Bucket list + color map.
-    const buckets = Array.from(bucketSet).sort();
-    const bucketColor = new Map();
-    buckets.forEach((b, i) => bucketColor.set(b, PALETTE[i % PALETTE.length]));
+    const keepEdges = edges.filter((e) => allIdx.has(e.s) && allIdx.has(e.t));
 
     // Seed graph layout deterministically on a circle.
-    keep.forEach((n, i) => {
-      const a = (i / Math.max(1, keep.length)) * Math.PI * 2;
+    allNodes.forEach((n, i) => {
+      const a = (i / Math.max(1, allNodes.length)) * Math.PI * 2;
       n.x = Math.cos(a) * 120;
       n.y = Math.sin(a) * 120;
       n.vx = 0;
       n.vy = 0;
     });
 
-    // Precompute cumulative event times (papers only) for the cumulative mode.
-    const paperDates = keep
-      .filter((n) => !n.isBucket)
-      .map((n) => n.date)
-      .sort((a, b) => a - b);
+    const paperDates = fileNodes.map((n) => n.date).sort((a, b) => a - b);
 
     this.data = {
-      nodes: keep,
+      nodes: allNodes,
+      fileNodes,
       edges: keepEdges,
-      idx: new Map(keep.map((n, i) => [n.id, i])),
-      buckets,
-      bucketColor,
+      idx: allIdx,
+      groups,
+      groupColor,
       paperDates,
     };
 
@@ -490,7 +821,7 @@ class DynamicGraphsView extends ItemView {
     this.lastNow = now;
 
     if (this.playing && this.range > 0) {
-      this.t += dt * (this.range / this.durationSec) * this.speed;
+      this.t += dt * (this.range / this.durationSec);
       if (this.t >= this.tMax) {
         this.t = this.tMax;
         this.playing = false;
@@ -499,7 +830,11 @@ class DynamicGraphsView extends ItemView {
       this.syncScrubber();
     }
 
-    this.render();
+    try {
+      this.render();
+    } catch (e) {
+      console.error('Dynamic Graphs: render error', e);
+    }
     this.raf = requestAnimationFrame(this.frame);
   }
 
@@ -510,21 +845,44 @@ class DynamicGraphsView extends ItemView {
     return v || fallback;
   }
 
+  fontFamily() {
+    // Canvas ctx.font can't resolve CSS var(); use the resolved family or a literal.
+    const f = this.css('--font-interface', '').trim();
+    return f && !f.includes('var(') ? f : 'sans-serif';
+  }
+
+  font(delta) {
+    const sz = this.plugin.settings.fontSize;
+    return `${Math.max(8, sz + (delta || 0))}px ${this.fontFamily()}`;
+  }
+
+  graphFont(delta) {
+    const sz = this.plugin.settings.graphFontSize;
+    return `${Math.max(8, sz + (delta || 0))}px ${this.fontFamily()}`;
+  }
+
+  colorOf(node) {
+    const g = node.groups && node.groups[0];
+    return (g && this.data.groupColor.get(g)) || this.css('--interactive-accent', '#5b8def');
+  }
+
   render() {
     const ctx = this.ctx;
     const W = this.W;
     const H = this.H;
     ctx.clearRect(0, 0, W, H);
 
-    if (this.dateLbl) {
-      this.dateLbl.setText(this.range > 0 ? fmtTime(this.t) : '—');
-    }
+    if (this.dateLbl) this.dateLbl.setText(this.range > 0 ? fmtTime(this.t) : '—');
 
-    if (!this.data || !this.data.nodes.length) {
+    if (!this.data || !this.data.fileNodes.length) {
       ctx.fillStyle = this.css('--text-muted', '#888');
-      ctx.font = '14px var(--font-interface, sans-serif)';
+      ctx.font = this.font(1);
       ctx.textAlign = 'center';
-      ctx.fillText('No dated notes found. Add date_added or year frontmatter, then reload (⟳).', W / 2, H / 2);
+      ctx.fillText(
+        'No dated notes found. Check the date/group mapping in settings (⚙), then reload (⟳).',
+        W / 2,
+        H / 2
+      );
       return;
     }
 
@@ -532,8 +890,8 @@ class DynamicGraphsView extends ItemView {
       case 'timeline':
         this.drawTimeline(ctx, W, H);
         break;
-      case 'buckets':
-        this.drawBuckets(ctx, W, H);
+      case 'groups':
+        this.drawGroups(ctx, W, H);
         break;
       case 'graph':
         this.drawGraph(ctx, W, H);
@@ -544,21 +902,15 @@ class DynamicGraphsView extends ItemView {
     }
   }
 
-  // Timeline sweep: notes plotted along an x=time axis, revealed by a sweep line.
   drawTimeline(ctx, W, H) {
     const padL = 40, padR = 20, padT = 30, padB = 36;
-    const x0 = padL, x1 = W - padR;
-    const y0 = padT, y1 = H - padB;
-    const data = this.data;
-    const txt = this.css('--text-muted', '#888');
+    const x0 = padL, x1 = W - padR, y0 = padT, y1 = H - padB;
     const accent = this.css('--interactive-accent', '#5b8def');
-
     const xOf = (ms) => x0 + ((ms - this.tMin) / this.range) * (x1 - x0);
 
-    // Year gridlines.
     ctx.strokeStyle = this.css('--background-modifier-border', '#3a3a3a');
-    ctx.fillStyle = txt;
-    ctx.font = '11px var(--font-interface, sans-serif)';
+    ctx.fillStyle = this.css('--text-muted', '#888');
+    ctx.font = this.font(-1);
     ctx.textAlign = 'center';
     const yStart = new Date(this.tMin).getUTCFullYear();
     const yEnd = new Date(this.tMax).getUTCFullYear();
@@ -574,24 +926,21 @@ class DynamicGraphsView extends ItemView {
       ctx.fillText(String(y), xx, H - 14);
     }
 
-    // Lay nodes into vertical lanes by index for separation.
-    const papers = data.nodes.filter((n) => !n.isBucket);
-    papers.sort((a, b) => a.date - b.date);
+    const papers = this.data.fileNodes.slice().sort((a, b) => a.date - b.date);
     const lanes = Math.max(1, Math.floor((y1 - y0) / 26));
     ctx.textAlign = 'left';
+    ctx.font = this.font();
     papers.forEach((n, i) => {
       const reveal = smoothstep(n.date, n.date + this.range * 0.01, this.t);
       if (reveal <= 0.001) return;
       const xx = xOf(n.date);
       const lane = i % lanes;
       const yy = y0 + (lane + 0.5) * ((y1 - y0) / lanes);
-      const col = data.bucketColor.get(n.buckets[0]) || accent;
       ctx.globalAlpha = reveal;
-      ctx.fillStyle = col;
+      ctx.fillStyle = this.colorOf(n);
       ctx.beginPath();
       ctx.arc(xx, yy, 4, 0, Math.PI * 2);
       ctx.fill();
-      // Label fades in slightly after the dot.
       const lab = smoothstep(n.date + this.range * 0.005, n.date + this.range * 0.03, this.t);
       ctx.globalAlpha = reveal * lab * 0.9;
       ctx.fillStyle = this.css('--text-normal', '#ddd');
@@ -599,7 +948,6 @@ class DynamicGraphsView extends ItemView {
     });
     ctx.globalAlpha = 1;
 
-    // Sweep line.
     const sx = xOf(this.t);
     ctx.strokeStyle = accent;
     ctx.lineWidth = 2;
@@ -610,67 +958,68 @@ class DynamicGraphsView extends ItemView {
     ctx.lineWidth = 1;
   }
 
-  // Bucket growth: a bar per bucket, height = #papers assigned with date <= t.
-  drawBuckets(ctx, W, H) {
+  drawGroups(ctx, W, H) {
     const data = this.data;
-    const buckets = data.buckets;
-    if (!buckets.length) {
+    const groups = data.groups;
+    if (!groups.length) {
       ctx.fillStyle = this.css('--text-muted', '#888');
       ctx.textAlign = 'center';
-      ctx.font = '14px var(--font-interface, sans-serif)';
-      ctx.fillText('No buckets defined. Add a buckets: list to frontmatter.', W / 2, H / 2);
+      ctx.font = this.font(1);
+      ctx.fillText('No groups found. Check the "Group by" setting (⚙).', W / 2, H / 2);
       return;
     }
 
-    const counts = buckets.map(() => 0);
-    let maxPossible = 1;
-    const tally = buckets.map(() => 0);
-    for (const n of data.nodes) {
-      if (n.isBucket) continue;
-      for (const b of n.buckets) {
-        const bi = buckets.indexOf(b);
-        if (bi < 0) continue;
-        tally[bi]++;
-        if (n.date <= this.t) counts[bi]++;
+    const counts = groups.map(() => 0);
+    const totals = groups.map(() => 0);
+    for (const n of data.fileNodes) {
+      for (const g of n.groups) {
+        const gi = groups.indexOf(g);
+        if (gi < 0) continue;
+        totals[gi]++;
+        if (n.date <= this.t) counts[gi]++;
       }
     }
-    maxPossible = Math.max(1, ...tally);
+    const maxPossible = Math.max(1, ...totals);
 
-    const padL = 16, padR = 16, padT = 24, padB = 70;
-    const x0 = padL, x1 = W - padR, y0 = padT, y1 = H - padB;
-    const n = buckets.length;
-    const gap = 14;
-    const bw = Math.max(8, (x1 - x0 - gap * (n - 1)) / n);
+    const padT = 24, padR = 16, gap = 14;
+    const n = groups.length;
 
+    // Measure labels so the bottom/left margins scale with the font (rotated 45°).
+    ctx.font = this.font();
     ctx.textAlign = 'center';
-    ctx.font = '11px var(--font-interface, sans-serif)';
+    const labels = groups.map((g) => (g.length > 28 ? g.slice(0, 27) + '…' : g));
+    let maxLabelW = 0;
+    for (const l of labels) maxLabelW = Math.max(maxLabelW, ctx.measureText(l).width);
+    const diag = maxLabelW * Math.SQRT1_2;
+    const padB = Math.ceil(diag) + this.fontSize + 16;
+    let padL = 16;
+    let bw = Math.max(8, (W - padL - padR - gap * (n - 1)) / n);
+    const overflowL = diag - (padL + bw / 2); // leftmost label extending past the edge
+    if (overflowL > 0) {
+      padL += Math.ceil(overflowL) + 8;
+      bw = Math.max(8, (W - padL - padR - gap * (n - 1)) / n);
+    }
+    const x0 = padL, x1 = W - padR, y0 = padT, y1 = H - padB;
+
     for (let i = 0; i < n; i++) {
       const bx = x0 + i * (bw + gap);
-      const frac = counts[i] / maxPossible;
-      const bh = frac * (y1 - y0);
-      const col = data.bucketColor.get(buckets[i]) || '#888';
-      ctx.fillStyle = col;
+      const bh = (counts[i] / maxPossible) * (y1 - y0);
+      ctx.fillStyle = data.groupColor.get(groups[i]) || '#888';
       ctx.fillRect(bx, y1 - bh, bw, bh);
-
-      // Count above bar.
       if (counts[i] > 0) {
         ctx.fillStyle = this.css('--text-normal', '#ddd');
-        ctx.fillText(String(counts[i]), bx + bw / 2, y1 - bh - 5);
+        ctx.fillText(String(counts[i]), bx + bw / 2, y1 - bh - 6);
       }
-
-      // Rotated label below.
       ctx.save();
       ctx.translate(bx + bw / 2, y1 + 8);
       ctx.rotate(-Math.PI / 4);
       ctx.fillStyle = this.css('--text-muted', '#aaa');
       ctx.textAlign = 'right';
-      const label = buckets[i].length > 22 ? buckets[i].slice(0, 21) + '…' : buckets[i];
-      ctx.fillText(label, 0, 0);
+      ctx.fillText(labels[i], 0, 0);
       ctx.restore();
       ctx.textAlign = 'center';
     }
 
-    // Baseline.
     ctx.strokeStyle = this.css('--background-modifier-border', '#3a3a3a');
     ctx.beginPath();
     ctx.moveTo(x0, y1);
@@ -678,34 +1027,25 @@ class DynamicGraphsView extends ItemView {
     ctx.stroke();
   }
 
-  // Graph timelapse: force-directed layout; nodes/edges fade in over time.
   drawGraph(ctx, W, H) {
     const data = this.data;
     const cx = W / 2, cy = H / 2;
 
-    // Active nodes/edges at time t.
     const active = data.nodes.filter((n) => n.date <= this.t);
     const activeSet = new Set(active.map((n) => n.id));
     const activeEdges = data.edges.filter((e) => activeSet.has(e.s) && activeSet.has(e.t));
 
-    // --- Force simulation step (only on active nodes) ---
-    const k = 0.02; // spring
-    const rep = 1400; // repulsion
-    const center = 0.012;
-    const damp = 0.86;
-
+    const k = 0.02, rep = 1400, center = 0.012, damp = 0.86;
     for (let i = 0; i < active.length; i++) {
       const a = active[i];
       for (let j = i + 1; j < active.length; j++) {
         const b = active[j];
-        let dx = a.x - b.x;
-        let dy = a.y - b.y;
+        let dx = a.x - b.x, dy = a.y - b.y;
         let d2 = dx * dx + dy * dy;
         if (d2 < 1) d2 = 1;
         const f = rep / d2;
         const d = Math.sqrt(d2);
-        const fx = (dx / d) * f;
-        const fy = (dy / d) * f;
+        const fx = (dx / d) * f, fy = (dy / d) * f;
         a.vx += fx; a.vy += fy;
         b.vx -= fx; b.vy -= fy;
       }
@@ -713,13 +1053,10 @@ class DynamicGraphsView extends ItemView {
     for (const e of activeEdges) {
       const a = data.nodes[data.idx.get(e.s)];
       const b = data.nodes[data.idx.get(e.t)];
-      const dx = b.x - a.x;
-      const dy = b.y - a.y;
+      const dx = b.x - a.x, dy = b.y - a.y;
       const d = Math.sqrt(dx * dx + dy * dy) || 1;
-      const target = 70;
-      const f = (d - target) * k;
-      const fx = (dx / d) * f;
-      const fy = (dy / d) * f;
+      const f = (d - 70) * k;
+      const fx = (dx / d) * f, fy = (dy / d) * f;
       a.vx += fx; a.vy += fy;
       b.vx -= fx; b.vy -= fy;
     }
@@ -732,7 +1069,6 @@ class DynamicGraphsView extends ItemView {
       a.y += a.vy;
     }
 
-    // --- Draw ---
     ctx.save();
     ctx.translate(cx, cy);
 
@@ -749,52 +1085,39 @@ class DynamicGraphsView extends ItemView {
     ctx.globalAlpha = 1;
 
     ctx.textAlign = 'center';
-    ctx.font = '10px var(--font-interface, sans-serif)';
+    const textCol = this.css('--text-normal', '#eee');
     for (const n of active) {
       const appear = smoothstep(n.date, n.date + this.range * 0.015, this.t);
-      const r = (n.isBucket ? 9 : 5) * (0.4 + 0.6 * appear);
-      const col = n.isBucket
-        ? data.bucketColor.get(n.basename || n.title) || '#bbb'
-        : data.bucketColor.get(n.buckets[0]) || this.css('--interactive-accent', '#5b8def');
+      const r = (n.isGroup ? 9 : 5) * (0.4 + 0.6 * appear);
       ctx.globalAlpha = appear;
-      ctx.fillStyle = col;
+      ctx.fillStyle = this.colorOf(n);
       ctx.beginPath();
       ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
       ctx.fill();
-      if (n.isBucket) {
-        ctx.fillStyle = this.css('--text-normal', '#eee');
-        ctx.fillText(n.title, n.x, n.y - r - 3);
-      }
+      // Label every node; hubs above (full size), notes below (one step down).
+      ctx.font = n.isGroup ? this.graphFont() : this.graphFont(-1);
+      ctx.fillStyle = textCol;
+      const dy = n.isGroup ? -r - 4 : r + this.plugin.settings.graphFontSize;
+      ctx.fillText(n.title, n.x, n.y + dy);
     }
     ctx.globalAlpha = 1;
     ctx.restore();
 
-    // Stash transform-adjusted positions for hit testing.
     this._graphOffset = { cx, cy };
   }
 
-  // Cumulative line: running count of papers vs time, drawn up to t.
   drawCumulative(ctx, W, H) {
-    const data = this.data;
-    const dates = data.paperDates;
-    if (!dates.length) {
-      ctx.fillStyle = this.css('--text-muted', '#888');
-      ctx.textAlign = 'center';
-      ctx.font = '14px var(--font-interface, sans-serif)';
-      ctx.fillText('No dated papers to count.', W / 2, H / 2);
-      return;
-    }
+    const dates = this.data.paperDates;
+    if (!dates.length) return;
 
     const padL = 44, padR = 20, padT = 24, padB = 36;
     const x0 = padL, x1 = W - padR, y0 = padT, y1 = H - padB;
     const total = dates.length;
     const accent = this.css('--interactive-accent', '#5b8def');
     const txt = this.css('--text-muted', '#888');
-
     const xOf = (ms) => x0 + ((ms - this.tMin) / this.range) * (x1 - x0);
     const yOf = (c) => y1 - (c / total) * (y1 - y0);
 
-    // Axes.
     ctx.strokeStyle = this.css('--background-modifier-border', '#3a3a3a');
     ctx.beginPath();
     ctx.moveTo(x0, y0);
@@ -802,9 +1125,8 @@ class DynamicGraphsView extends ItemView {
     ctx.lineTo(x1, y1);
     ctx.stroke();
 
-    // Y ticks.
     ctx.fillStyle = txt;
-    ctx.font = '11px var(--font-interface, sans-serif)';
+    ctx.font = this.font(-1);
     ctx.textAlign = 'right';
     const yTicks = Math.min(total, 5);
     for (let i = 0; i <= yTicks; i++) {
@@ -819,40 +1141,33 @@ class DynamicGraphsView extends ItemView {
       ctx.globalAlpha = 1;
     }
 
-    // X (year) ticks.
     ctx.textAlign = 'center';
     const yStart = new Date(this.tMin).getUTCFullYear();
     const yEnd = new Date(this.tMax).getUTCFullYear();
     const yStep = Math.max(1, Math.ceil((yEnd - yStart) / 8));
     for (let y = yStart; y <= yEnd; y += yStep) {
-      const xx = xOf(Date.UTC(y, 0, 1));
-      ctx.fillText(String(y), xx, H - 12);
+      ctx.fillText(String(y), xOf(Date.UTC(y, 0, 1)), H - 12);
     }
 
-    // Cumulative step path up to current t.
     ctx.strokeStyle = accent;
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(x0, yOf(0));
     let count = 0;
-    let lastX = x0, lastY = yOf(0);
+    let lastY = yOf(0);
     for (const d of dates) {
       if (d > this.t) break;
       const xx = xOf(d);
-      ctx.lineTo(xx, lastY); // horizontal to event
+      ctx.lineTo(xx, lastY);
       count++;
-      const yy = yOf(count);
-      ctx.lineTo(xx, yy); // vertical step
-      lastX = xx;
-      lastY = yy;
+      lastY = yOf(count);
+      ctx.lineTo(xx, lastY);
     }
-    // Extend flat to the current time marker.
     const tx = xOf(this.t);
     ctx.lineTo(tx, lastY);
     ctx.stroke();
     ctx.lineWidth = 1;
 
-    // Marker.
     ctx.fillStyle = accent;
     ctx.beginPath();
     ctx.arc(tx, lastY, 4, 0, Math.PI * 2);
@@ -862,19 +1177,17 @@ class DynamicGraphsView extends ItemView {
     ctx.fillText(String(count), tx + 8, lastY - 6);
   }
 
-  // --- Interaction (graph + timeline hit testing) -------------------------
+  // --- Interaction --------------------------------------------------------
 
   pickGraphNode(mx, my) {
     if (!this.data || this.mode !== 'graph' || !this._graphOffset) return null;
     const { cx, cy } = this._graphOffset;
-    const lx = mx - cx;
-    const ly = my - cy;
+    const lx = mx - cx, ly = my - cy;
     let best = null;
     let bestD = 14 * 14;
     for (const n of this.data.nodes) {
       if (n.date > this.t) continue;
-      const dx = n.x - lx;
-      const dy = n.y - ly;
+      const dx = n.x - lx, dy = n.y - ly;
       const d2 = dx * dx + dy * dy;
       if (d2 < bestD) {
         bestD = d2;
@@ -886,15 +1199,14 @@ class DynamicGraphsView extends ItemView {
 
   onMouseMove(e) {
     const rect = this.canvas.getBoundingClientRect();
-    const mx = e.clientX - rect.left;
-    const my = e.clientY - rect.top;
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
     const node = this.pickGraphNode(mx, my);
     if (node) {
       this.tooltip.style.display = 'block';
       this.tooltip.style.left = mx + 12 + 'px';
       this.tooltip.style.top = my + 12 + 'px';
       this.tooltip.setText(node.title + (node.year ? ` (${node.year})` : ''));
-      this.canvas.style.cursor = 'pointer';
+      this.canvas.style.cursor = node.file ? 'pointer' : 'default';
     } else {
       this.tooltip.style.display = 'none';
       this.canvas.style.cursor = 'default';
@@ -903,8 +1215,7 @@ class DynamicGraphsView extends ItemView {
 
   onClick(e) {
     const rect = this.canvas.getBoundingClientRect();
-    const mx = e.clientX - rect.left;
-    const my = e.clientY - rect.top;
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
     const node = this.pickGraphNode(mx, my);
     if (node && node.file) {
       this.plugin.app.workspace.getLeaf(false).openFile(node.file);
