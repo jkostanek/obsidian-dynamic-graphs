@@ -128,6 +128,24 @@ function normList(v) {
     .filter(Boolean);
 }
 
+function fmValue(v) {
+  if (v == null) return '';
+  return Array.isArray(v) ? v.join(', ') : String(v);
+}
+
+// Hover spec is either a bare frontmatter key, or a template with {field}
+// placeholders (e.g. "{author} — {title}"). Returns '' if nothing resolves.
+function hoverFrom(fm, spec) {
+  if (!spec) return '';
+  if (spec.indexOf('{') !== -1) {
+    return spec
+      .replace(/\{([^}]+)\}/g, (_, k) => fmValue(fm[k.trim()]))
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+  return fmValue(fm[spec]).trim();
+}
+
 function fmtTime(ms) {
   const d = new Date(ms);
   const y = d.getUTCFullYear();
@@ -285,8 +303,8 @@ class DynamicGraphsSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName('Hover text property')
-      .setDesc('Frontmatter key shown in the hover tooltip (e.g. a full title). Falls back to the label.')
+      .setName('Hover text')
+      .setDesc('Hover-tooltip text: a frontmatter key, or a template with {field} placeholders (e.g. "{author} — {title}"). Falls back to the label.')
       .addText((t) =>
         t.setPlaceholder('(label)').setValue(s.hoverProp).onChange((v) => {
           s.hoverProp = v.trim();
@@ -447,7 +465,9 @@ class DynamicGraphsView extends ItemView {
       fontSize: this.plugin.settings.tooltipFontSize + 'px',
       color: 'var(--text-normal)',
       display: 'none',
-      whiteSpace: 'nowrap',
+      whiteSpace: 'normal',
+      wordBreak: 'break-word',
+      lineHeight: '1.3',
       zIndex: '10',
     });
 
@@ -805,13 +825,12 @@ class DynamicGraphsView extends ItemView {
 
       const labelVal = s.labelProp && fm[s.labelProp];
       const label = (labelVal && String(labelVal)) || f.basename;
-      const hoverVal = s.hoverProp && fm[s.hoverProp];
       idx.set(f.path, fileNodes.length);
       fileNodes.push({
         id: f.path,
         file: f,
         title: label,
-        hover: (hoverVal && String(hoverVal)) || label,
+        hover: hoverFrom(fm, s.hoverProp) || label,
         year,
         date,
         groups,
@@ -1051,7 +1070,7 @@ class DynamicGraphsView extends ItemView {
   }
 
   drawTimeline(ctx, W, H) {
-    const padL = 40, padR = 20, padT = 30, padB = 36;
+    const padL = 44, padR = 28, padT = 24, padB = 46;
     const x0 = padL, x1 = W - padR, y0 = padT, y1 = H - padB;
     const accent = this.css('--interactive-accent', '#5b8def');
     const xOf = (ms) => x0 + ((ms - this.tMin) / this.range) * (x1 - x0);
@@ -1060,6 +1079,7 @@ class DynamicGraphsView extends ItemView {
     ctx.fillStyle = this.css('--text-muted', '#888');
     ctx.font = this.font(-1);
     ctx.textAlign = 'center';
+    const labelY = y1 + 18; // year labels sit just under the axis, not at the edge
     const yStart = new Date(this.tMin).getUTCFullYear();
     const yEnd = new Date(this.tMax).getUTCFullYear();
     const yStep = Math.max(1, Math.ceil((yEnd - yStart) / 12));
@@ -1071,7 +1091,7 @@ class DynamicGraphsView extends ItemView {
       ctx.lineTo(xx, y1);
       ctx.stroke();
       ctx.globalAlpha = 1;
-      ctx.fillText(String(y), xx, H - 14);
+      ctx.fillText(String(y), xx, labelY);
     }
 
     const papers = this.data.fileNodes.slice().sort((a, b) => a.date - b.date);
@@ -1095,7 +1115,15 @@ class DynamicGraphsView extends ItemView {
       if (showLabels) {
         ctx.globalAlpha = reveal * 0.9;
         ctx.fillStyle = this.css('--text-normal', '#ddd');
-        ctx.fillText(n.title, xx + 7, yy + 3);
+        const w = ctx.measureText(n.title).width;
+        if (xx + 7 + w > W - 2) {
+          // Near the right edge: place the label to the left of the dot.
+          ctx.textAlign = 'right';
+          ctx.fillText(n.title, xx - 7, yy + 3);
+          ctx.textAlign = 'left';
+        } else {
+          ctx.fillText(n.title, xx + 7, yy + 3);
+        }
       }
     });
     ctx.globalAlpha = 1;
@@ -1441,9 +1469,19 @@ class DynamicGraphsView extends ItemView {
     const node = this.pickNode(mx, my);
     if (node) {
       this.tooltip.style.display = 'block';
-      this.tooltip.style.left = mx + 12 + 'px';
-      this.tooltip.style.top = my + 12 + 'px';
+      // Wrap long hover text (~100 chars) instead of one long line; never exceed canvas.
+      this.tooltip.style.maxWidth = Math.min(this.W - 16, 600) + 'px';
       this.tooltip.setText((node.hover || node.title) + (node.year ? ` (${node.year})` : ''));
+      // Keep the tooltip inside the canvas: flip left/up near the edges.
+      const tw = this.tooltip.offsetWidth, th = this.tooltip.offsetHeight;
+      let left = mx + 12;
+      if (left + tw > this.W - 2) left = mx - 12 - tw;
+      if (left < 2) left = 2;
+      let top = my + 12;
+      if (top + th > this.H - 2) top = my - 12 - th;
+      if (top < 2) top = 2;
+      this.tooltip.style.left = left + 'px';
+      this.tooltip.style.top = top + 'px';
       this.canvas.style.cursor = node.file ? 'pointer' : 'default';
     } else {
       this.tooltip.style.display = 'none';

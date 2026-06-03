@@ -34,8 +34,9 @@ Everything below is configurable; defaults in parentheses.
   **time axis** control; it drives the animation in every mode, not just the ones
   with a literal time axis.
 - **Label property** — node label; falls back to the file name (`short_title`).
-- **Hover text property** — frontmatter key shown in the hover tooltip, e.g. a full
-  title; falls back to the label. (Hover works in graph and timeline modes.)
+- **Hover text** — hover-tooltip text: a frontmatter key, or a template with
+  `{field}` placeholders (e.g. `{author} — {title}`). Falls back to the label.
+  (Hover works in graph and timeline modes.)
 - **Group by** — `Obsidian tags` or a `Frontmatter property` (default: property
   named `buckets`). Drives grouping and color in every mode.
 - **Folder scope** — limit to a folder, or blank for the whole vault.
