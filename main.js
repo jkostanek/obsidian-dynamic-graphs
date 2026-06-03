@@ -38,9 +38,13 @@ const DEFAULT_SETTINGS = {
   edgeSource: 'references', // 'references' (links under the heading) | 'all' (all outgoing links)
   refHeading: 'References', // heading whose section supplies edges
   showGroupNodes: true, // synthesize a hub node per group in the graph mode
+  showNodeLabels: true, // draw note labels in the graph
+  showGroupLabels: true, // draw group hub labels in the graph
   durationSec: 8, // seconds for one full sweep (toolbar slow↔fast slider, 2–15)
-  fontSize: 14, // size (px) for axis/chart labels and the hover tooltip
-  graphFontSize: 14, // size (px) for node labels drawn inside the graph mode
+  axisFontSize: 14, // size (px) for axis & chart labels (timeline/groups/cumulative)
+  tooltipFontSize: 14, // size (px) for the hover tooltip (graph + timeline)
+  nodeFontSize: 14, // size (px) for note labels (graph + timeline)
+  groupFontSize: 14, // size (px) for group hub labels in the graph
   colorScheme: 'tableau', // group color palette (key of PALETTES)
 };
 
@@ -150,6 +154,13 @@ const GROUP_PREFIX = 'group::';
 module.exports = class DynamicGraphsPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
+
+    // Enlarge/bold the view-header title for our view type.
+    const styleEl = document.createElement('style');
+    styleEl.textContent =
+      `.workspace-leaf-content[data-type="${VIEW_TYPE}"] .view-header-title { font-size: 22px; font-weight: 700; }`;
+    document.head.appendChild(styleEl);
+    this.register(() => styleEl.remove());
 
     this.registerView(VIEW_TYPE, (leaf) => new DynamicGraphsView(leaf, this));
     this.addRibbonIcon('line-chart', 'Open Dynamic Graphs', () => this.activateView());
@@ -357,8 +368,6 @@ class DynamicGraphsView extends ItemView {
     this.mode = plugin.settings.defaultMode;
     this.playing = false;
     this.durationSec = plugin.settings.durationSec;
-    this.fontSize = plugin.settings.fontSize;
-    this.graphFontSize = plugin.settings.graphFontSize;
     this.t = 0;
     this.tMin = 0;
     this.tMax = 1;
@@ -366,6 +375,7 @@ class DynamicGraphsView extends ItemView {
     this.lastNow = 0;
     this.raf = null;
     this.data = null;
+    this.drag = null; // {node, tx, ty, ox, oy, moved} while dragging a node
     this.frame = this.frame.bind(this);
   }
 
@@ -409,18 +419,20 @@ class DynamicGraphsView extends ItemView {
       border: '1px solid var(--background-modifier-border)',
       borderRadius: '4px',
       padding: '2px 6px',
-      fontSize: this.fontSize + 'px',
+      fontSize: this.plugin.settings.tooltipFontSize + 'px',
       color: 'var(--text-normal)',
       display: 'none',
       whiteSpace: 'nowrap',
       zIndex: '10',
     });
 
+    this.registerDomEvent(this.canvas, 'mousedown', (e) => this.onMouseDown(e));
     this.registerDomEvent(this.canvas, 'mousemove', (e) => this.onMouseMove(e));
+    this.registerDomEvent(this.canvas, 'mouseup', (e) => this.onMouseUp(e));
     this.registerDomEvent(this.canvas, 'mouseleave', () => {
       this.tooltip.style.display = 'none';
+      this.drag = null;
     });
-    this.registerDomEvent(this.canvas, 'click', (e) => this.onClick(e));
 
     this.ro = new ResizeObserver(() => this.resize());
     this.ro.observe(canvasWrap);
@@ -444,10 +456,9 @@ class DynamicGraphsView extends ItemView {
   // Called by the plugin when settings change.
   reloadData() {
     this.durationSec = this.plugin.settings.durationSec;
-    this.fontSize = this.plugin.settings.fontSize;
-    this.graphFontSize = this.plugin.settings.graphFontSize;
-    if (this.tooltip) this.tooltip.style.fontSize = this.fontSize + 'px';
+    if (this.tooltip) this.tooltip.style.fontSize = this.plugin.settings.tooltipFontSize + 'px';
     if (this.schemeSel) this.schemeSel.value = this.plugin.settings.colorScheme;
+    if (this.axisSel) this.axisSel.value = this.plugin.settings.timeAxis;
     this.loadData();
   }
 
@@ -457,96 +468,60 @@ class DynamicGraphsView extends ItemView {
     const bar = root.createDiv();
     Object.assign(bar.style, {
       display: 'flex',
-      alignItems: 'center',
+      alignItems: 'flex-start',
       gap: '10px',
       flexWrap: 'wrap',
       padding: '8px 12px',
       borderBottom: '1px solid var(--background-modifier-border)',
     });
 
-    const modeSel = bar.createEl('select');
-    modeSel.addClass('dropdown');
-    for (const m of MODES) {
-      const opt = modeSel.createEl('option', { text: m.label });
-      opt.value = m.id;
-    }
-    modeSel.value = this.mode;
-    modeSel.onchange = () => {
-      this.mode = modeSel.value;
+    // --- small builders ---
+    const mkGroup = (caption) => {
+      const box = bar.createDiv();
+      Object.assign(box.style, {
+        display: 'flex', flexDirection: 'column', gap: '4px',
+        border: '1px solid var(--background-modifier-border)',
+        borderRadius: '6px', padding: '4px 8px',
+      });
+      const cap = box.createEl('div', { text: caption });
+      Object.assign(cap.style, {
+        fontSize: '10px', textTransform: 'uppercase', letterSpacing: '0.05em',
+        fontWeight: '600', color: 'var(--text-muted)',
+      });
+      return box;
     };
-    this.modeSel = modeSel;
-
-    const restartBtn = bar.createEl('button', { text: '⏮' });
-    restartBtn.title = 'Restart';
-    restartBtn.onclick = () => {
-      this.t = this.tMin;
-      this.syncScrubber();
+    const mkRow = (parent) => {
+      const row = parent.createDiv();
+      Object.assign(row.style, { display: 'flex', alignItems: 'center', gap: '8px' });
+      return row;
     };
-
-    const playBtn = bar.createEl('button', { text: '▶' });
-    playBtn.title = 'Play / pause';
-    this.playBtn = playBtn;
-    playBtn.onclick = () => this.togglePlay();
-
-    const scrub = bar.createEl('input');
-    scrub.type = 'range';
-    scrub.min = '0';
-    scrub.max = '1000';
-    scrub.value = '0';
-    scrub.style.flex = '0 1 220px';
-    this.scrub = scrub;
-    scrub.oninput = () => {
-      const f = parseInt(scrub.value, 10) / 1000;
-      this.t = this.tMin + f * this.range;
+    const addLabel = (parent, text) => {
+      const sp = parent.createEl('span', { text });
+      Object.assign(sp.style, { color: 'var(--text-muted)', minWidth: '70px' });
     };
-
-    const dateLbl = bar.createEl('span');
-    dateLbl.style.fontVariantNumeric = 'tabular-nums';
-    dateLbl.style.minWidth = '92px';
-    dateLbl.style.color = 'var(--text-muted)';
-    this.dateLbl = dateLbl;
-
-    const speedWrap = bar.createDiv();
-    speedWrap.style.display = 'flex';
-    speedWrap.style.alignItems = 'center';
-    speedWrap.style.gap = '4px';
-    speedWrap.createEl('span', { text: 'slow' }).style.color = 'var(--text-muted)';
-    const speed = speedWrap.createEl('input');
-    speed.type = 'range';
-    speed.min = '2';
-    speed.max = '15';
-    speed.step = '1';
-    // Runs slow→fast left-to-right; slider value maps to seconds as (17 - value).
-    this.durationSec = clamp(this.durationSec, 2, 15);
-    speed.value = String(17 - this.durationSec);
-    speed.style.width = '110px';
-    speed.title = 'Animation speed (2–15 s per sweep)';
-    speed.oninput = () => {
-      this.durationSec = 17 - parseInt(speed.value, 10);
-      this.plugin.settings.durationSec = this.durationSec;
-      this.plugin.saveSettings(false);
+    const addCheck = (parent, labelText, get, set, title) => {
+      addLabel(parent, labelText);
+      const cb = parent.createEl('input');
+      cb.type = 'checkbox';
+      cb.checked = get();
+      cb.title = title;
+      cb.onchange = () => {
+        set(cb.checked);
+        this.plugin.saveSettings(false);
+      };
     };
-    speedWrap.createEl('span', { text: 'fast' }).style.color = 'var(--text-muted)';
-
-    // Font-size controls (live; persisted but not in the settings tab).
-    const fontWrap = bar.createDiv();
-    fontWrap.style.display = 'flex';
-    fontWrap.style.alignItems = 'center';
-    fontWrap.style.gap = '4px';
-    const mkFontInput = (label, get, set, title) => {
-      fontWrap.createEl('span', { text: label }).style.color = 'var(--text-muted)';
-      const inp = fontWrap.createEl('input');
+    const addFontSlider = (parent, labelText, get, set, title) => {
+      addLabel(parent, labelText);
+      const inp = parent.createEl('input');
       inp.type = 'range';
       inp.min = String(FONT_MIN);
       inp.max = String(FONT_MAX);
       inp.step = '1';
       inp.value = String(get());
-      inp.style.width = '84px';
+      inp.style.width = '80px';
       inp.title = title;
-      const val = fontWrap.createEl('span', { text: String(get()) });
-      val.style.color = 'var(--text-muted)';
-      val.style.minWidth = '18px';
-      val.style.fontVariantNumeric = 'tabular-nums';
+      const val = parent.createEl('span', { text: String(get()) });
+      Object.assign(val.style, { color: 'var(--text-muted)', minWidth: '18px', fontVariantNumeric: 'tabular-nums' });
       inp.oninput = () => {
         let v = parseInt(inp.value, 10);
         if (isNaN(v)) return;
@@ -556,27 +531,96 @@ class DynamicGraphsView extends ItemView {
         this.plugin.saveSettings(false);
       };
     };
-    mkFontInput(
-      'label',
-      () => this.plugin.settings.fontSize,
-      (v) => {
-        this.plugin.settings.fontSize = v;
-        this.fontSize = v;
-        if (this.tooltip) this.tooltip.style.fontSize = v + 'px';
-      },
-      'Axis, chart & tooltip label size (px)'
-    );
-    mkFontInput(
-      'node',
-      () => this.plugin.settings.graphFontSize,
-      (v) => {
-        this.plugin.settings.graphFontSize = v;
-        this.graphFontSize = v;
-      },
-      'Graph node label size (px)'
-    );
 
-    const schemeSel = bar.createEl('select');
+    // Controls that only apply to some graph types; toggled on mode change.
+    this.modeVis = [];
+    const showIn = (el, modes, onDisplay) => {
+      this.modeVis.push({ el, modes, onDisplay: onDisplay || 'flex' });
+      return el;
+    };
+
+    // --- Playback group ---
+    const playBox = mkGroup('Playback');
+    const play = mkRow(playBox);
+
+    const playBtn = play.createEl('button', { text: '▶' });
+    playBtn.title = 'Play / pause';
+    this.playBtn = playBtn;
+    playBtn.onclick = () => this.togglePlay();
+
+    const scrub = play.createEl('input');
+    scrub.type = 'range';
+    scrub.min = '0';
+    scrub.max = '1000';
+    scrub.value = '0';
+    scrub.style.flex = '0 1 200px';
+    this.scrub = scrub;
+    scrub.oninput = () => {
+      const f = parseInt(scrub.value, 10) / 1000;
+      this.t = this.tMin + f * this.range;
+    };
+
+    const rewindBtn = play.createEl('button', { text: '⏮' });
+    rewindBtn.title = 'Rewind to start';
+    rewindBtn.onclick = () => {
+      this.t = this.tMin;
+      this.syncScrubber();
+    };
+
+    const resetBtn = play.createEl('button', { text: '↺' });
+    resetBtn.title = 'Reset (stop and rewind to start)';
+    resetBtn.onclick = () => {
+      this.t = this.tMin;
+      this.playing = false;
+      this.playBtn.setText('▶');
+      this.syncScrubber();
+    };
+
+    const dateLbl = play.createEl('span');
+    dateLbl.style.fontVariantNumeric = 'tabular-nums';
+    dateLbl.style.minWidth = '92px';
+    dateLbl.style.color = 'var(--text-muted)';
+    this.dateLbl = dateLbl;
+
+    const speedWrap = play.createDiv();
+    Object.assign(speedWrap.style, { display: 'flex', alignItems: 'center', gap: '4px' });
+    speedWrap.createEl('span', { text: 'slow' }).style.color = 'var(--text-muted)';
+    const speed = speedWrap.createEl('input');
+    speed.type = 'range';
+    speed.min = '2';
+    speed.max = '15';
+    speed.step = '1';
+    // Runs slow→fast left-to-right; slider value maps to seconds as (17 - value).
+    this.durationSec = clamp(this.durationSec, 2, 15);
+    speed.value = String(17 - this.durationSec);
+    speed.style.width = '100px';
+    speed.title = 'Animation speed (2–15 s per sweep)';
+    speed.oninput = () => {
+      this.durationSec = 17 - parseInt(speed.value, 10);
+      this.plugin.settings.durationSec = this.durationSec;
+      this.plugin.saveSettings(false);
+    };
+    speedWrap.createEl('span', { text: 'fast' }).style.color = 'var(--text-muted)';
+
+    // --- Graph group (graph type + color palette) ---
+    const graphBox = mkGroup('Graph');
+    const graph = mkRow(graphBox);
+
+    const modeSel = graph.createEl('select');
+    modeSel.addClass('dropdown');
+    for (const m of MODES) {
+      const opt = modeSel.createEl('option', { text: m.label });
+      opt.value = m.id;
+    }
+    modeSel.value = this.mode;
+    modeSel.title = 'Graph type';
+    modeSel.onchange = () => {
+      this.mode = modeSel.value;
+      this.applyModeVisibility();
+    };
+    this.modeSel = modeSel;
+
+    const schemeSel = graph.createEl('select');
     schemeSel.addClass('dropdown');
     for (const key of Object.keys(PALETTE_LABELS)) {
       const o = schemeSel.createEl('option', { text: PALETTE_LABELS[key] });
@@ -589,15 +633,38 @@ class DynamicGraphsView extends ItemView {
       this.plugin.saveSettings(true);
     };
     this.schemeSel = schemeSel;
+    showIn(schemeSel, ['timeline', 'groups', 'graph'], '');
 
-    const reloadBtn = bar.createEl('button', { text: '⟳' });
+    const axisWrap = graph.createDiv();
+    Object.assign(axisWrap.style, { display: 'flex', alignItems: 'center', gap: '4px' });
+    axisWrap.createEl('span', { text: 'x-axis' }).style.color = 'var(--text-muted)';
+    const axisSel = axisWrap.createEl('select');
+    axisSel.addClass('dropdown');
+    const optDate = axisSel.createEl('option', { text: 'Date' });
+    optDate.value = 'date';
+    const optYear = axisSel.createEl('option', { text: 'Year' });
+    optYear.value = 'year';
+    axisSel.value = this.plugin.settings.timeAxis;
+    axisSel.title = 'Time x-axis: date or year';
+    axisSel.onchange = () => {
+      this.plugin.settings.timeAxis = axisSel.value;
+      this.plugin.saveSettings(true);
+    };
+    this.axisSel = axisSel;
+    showIn(axisWrap, ['timeline', 'cumulative'], 'flex');
+
+    // --- trailing utility (top row, right) ---
+    const util = bar.createDiv();
+    Object.assign(util.style, { display: 'flex', alignItems: 'center', gap: '6px', marginLeft: 'auto' });
+
+    const reloadBtn = util.createEl('button', { text: '⟳' });
     reloadBtn.title = 'Reload data from vault';
     reloadBtn.onclick = () => {
       this.loadData();
       new Notice(`Dynamic Graphs: ${this.data.nodes.length} notes, ${this.data.edges.length} links`);
     };
 
-    const gear = bar.createEl('button', { text: '⚙' });
+    const gear = util.createEl('button', { text: '⚙' });
     gear.title = 'Settings';
     gear.onclick = () => {
       const app = this.plugin.app;
@@ -606,6 +673,46 @@ class DynamicGraphsView extends ItemView {
         app.setting.openTabById(this.plugin.manifest.id);
       }
     };
+
+    // --- row break: label groups wrap to the next line ---
+    const brk = bar.createDiv();
+    Object.assign(brk.style, { flexBasis: '100%', height: '0' });
+
+    // --- Node Labels group (graph only) ---
+    const nodesBox = mkGroup('Node Labels');
+    addCheck(mkRow(nodesBox), 'show', () => this.plugin.settings.showNodeLabels,
+      (v) => (this.plugin.settings.showNodeLabels = v), 'Show note labels in the graph');
+    addFontSlider(mkRow(nodesBox), 'label size', () => this.plugin.settings.nodeFontSize,
+      (v) => (this.plugin.settings.nodeFontSize = v), 'Note label size (px)');
+    addFontSlider(mkRow(nodesBox), 'hover size', () => this.plugin.settings.tooltipFontSize,
+      (v) => {
+        this.plugin.settings.tooltipFontSize = v;
+        if (this.tooltip) this.tooltip.style.fontSize = v + 'px';
+      }, 'Hover-tooltip text size (px)');
+    showIn(nodesBox, ['graph', 'timeline'], 'flex');
+
+    // --- Group Labels group (graph only) ---
+    const groupsBox = mkGroup('Group Labels');
+    addCheck(mkRow(groupsBox), 'show', () => this.plugin.settings.showGroupLabels,
+      (v) => (this.plugin.settings.showGroupLabels = v), 'Show group hub labels in the graph');
+    addFontSlider(mkRow(groupsBox), 'label size', () => this.plugin.settings.groupFontSize,
+      (v) => (this.plugin.settings.groupFontSize = v), 'Group hub label size (px)');
+    showIn(groupsBox, ['graph'], 'flex');
+
+    // --- Text group (axis & chart text, non-graph modes) ---
+    const textBox = mkGroup('Text');
+    addFontSlider(mkRow(textBox), 'size', () => this.plugin.settings.axisFontSize,
+      (v) => (this.plugin.settings.axisFontSize = v), 'Axis & chart text size (px)');
+    showIn(textBox, ['timeline', 'groups', 'cumulative'], 'flex');
+
+    this.applyModeVisibility();
+  }
+
+  applyModeVisibility() {
+    if (!this.modeVis) return;
+    for (const e of this.modeVis) {
+      e.el.style.display = e.modes.includes(this.mode) ? e.onDisplay : 'none';
+    }
   }
 
   togglePlay() {
@@ -773,13 +880,23 @@ class DynamicGraphsView extends ItemView {
     }
     const keepEdges = edges.filter((e) => allIdx.has(e.s) && allIdx.has(e.t));
 
-    // Seed graph layout deterministically on a circle.
+    // Preserve positions across reloads; seed only new nodes on a ring.
+    const prevIdx = this.data ? this.data.idx : null;
+    const prevNodes = this.data ? this.data.nodes : null;
     allNodes.forEach((n, i) => {
-      const a = (i / Math.max(1, allNodes.length)) * Math.PI * 2;
-      n.x = Math.cos(a) * 120;
-      n.y = Math.sin(a) * 120;
-      n.vx = 0;
-      n.vy = 0;
+      const kept = prevIdx && prevIdx.has(n.id) ? prevNodes[prevIdx.get(n.id)] : null;
+      if (kept) {
+        n.x = kept.x;
+        n.y = kept.y;
+        n.vx = kept.vx;
+        n.vy = kept.vy;
+      } else {
+        const a = (i / Math.max(1, allNodes.length)) * Math.PI * 2;
+        n.x = Math.cos(a) * 140;
+        n.y = Math.sin(a) * 140;
+        n.vx = 0;
+        n.vy = 0;
+      }
     });
 
     const paperDates = fileNodes.map((n) => n.date).sort((a, b) => a - b);
@@ -852,13 +969,16 @@ class DynamicGraphsView extends ItemView {
   }
 
   font(delta) {
-    const sz = this.plugin.settings.fontSize;
+    const sz = this.plugin.settings.axisFontSize;
     return `${Math.max(8, sz + (delta || 0))}px ${this.fontFamily()}`;
   }
 
-  graphFont(delta) {
-    const sz = this.plugin.settings.graphFontSize;
-    return `${Math.max(8, sz + (delta || 0))}px ${this.fontFamily()}`;
+  nodeFont() {
+    return `${Math.max(8, this.plugin.settings.nodeFontSize)}px ${this.fontFamily()}`;
+  }
+
+  groupFont() {
+    return `${Math.max(8, this.plugin.settings.groupFontSize)}px ${this.fontFamily()}`;
   }
 
   colorOf(node) {
@@ -928,23 +1048,27 @@ class DynamicGraphsView extends ItemView {
 
     const papers = this.data.fileNodes.slice().sort((a, b) => a.date - b.date);
     const lanes = Math.max(1, Math.floor((y1 - y0) / 26));
+    const showLabels = this.plugin.settings.showNodeLabels;
+    this._timelineHits = [];
     ctx.textAlign = 'left';
-    ctx.font = this.font();
+    ctx.font = this.nodeFont();
     papers.forEach((n, i) => {
-      const reveal = smoothstep(n.date, n.date + this.range * 0.01, this.t);
+      const reveal = smoothstep(n.date - this.range * 0.012, n.date, this.t);
       if (reveal <= 0.001) return;
       const xx = xOf(n.date);
       const lane = i % lanes;
       const yy = y0 + (lane + 0.5) * ((y1 - y0) / lanes);
+      this._timelineHits.push({ node: n, x: xx, y: yy });
       ctx.globalAlpha = reveal;
       ctx.fillStyle = this.colorOf(n);
       ctx.beginPath();
       ctx.arc(xx, yy, 4, 0, Math.PI * 2);
       ctx.fill();
-      const lab = smoothstep(n.date + this.range * 0.005, n.date + this.range * 0.03, this.t);
-      ctx.globalAlpha = reveal * lab * 0.9;
-      ctx.fillStyle = this.css('--text-normal', '#ddd');
-      ctx.fillText(n.title, xx + 7, yy + 3);
+      if (showLabels) {
+        ctx.globalAlpha = reveal * 0.9;
+        ctx.fillStyle = this.css('--text-normal', '#ddd');
+        ctx.fillText(n.title, xx + 7, yy + 3);
+      }
     });
     ctx.globalAlpha = 1;
 
@@ -991,7 +1115,7 @@ class DynamicGraphsView extends ItemView {
     let maxLabelW = 0;
     for (const l of labels) maxLabelW = Math.max(maxLabelW, ctx.measureText(l).width);
     const diag = maxLabelW * Math.SQRT1_2;
-    const padB = Math.ceil(diag) + this.fontSize + 16;
+    const padB = Math.ceil(diag) + this.plugin.settings.axisFontSize + 16;
     let padL = 16;
     let bw = Math.max(8, (W - padL - padR - gap * (n - 1)) / n);
     const overflowL = diag - (padL + bw / 2); // leftmost label extending past the edge
@@ -1031,11 +1155,12 @@ class DynamicGraphsView extends ItemView {
     const data = this.data;
     const cx = W / 2, cy = H / 2;
 
-    const active = data.nodes.filter((n) => n.date <= this.t);
+    const fade = this.range * 0.015;
+    const active = data.nodes.filter((n) => n.date <= this.t + fade);
     const activeSet = new Set(active.map((n) => n.id));
     const activeEdges = data.edges.filter((e) => activeSet.has(e.s) && activeSet.has(e.t));
 
-    const k = 0.02, rep = 1400, center = 0.012, damp = 0.86;
+    const k = 0.02, rep = 1800, center = 0.012, damp = 0.88;
     for (let i = 0; i < active.length; i++) {
       const a = active[i];
       for (let j = i + 1; j < active.length; j++) {
@@ -1055,7 +1180,7 @@ class DynamicGraphsView extends ItemView {
       const b = data.nodes[data.idx.get(e.t)];
       const dx = b.x - a.x, dy = b.y - a.y;
       const d = Math.sqrt(dx * dx + dy * dy) || 1;
-      const f = (d - 70) * k;
+      const f = (d - 85) * k;
       const fx = (dx / d) * f, fy = (dy / d) * f;
       a.vx += fx; a.vy += fy;
       b.vx -= fx; b.vy -= fy;
@@ -1067,6 +1192,15 @@ class DynamicGraphsView extends ItemView {
       a.vy *= damp;
       a.x += a.vx;
       a.y += a.vy;
+    }
+
+    // Pin the dragged node to the cursor so the network flows around it.
+    if (this.drag && this.drag.moved && activeSet.has(this.drag.node.id)) {
+      const dn = this.drag.node;
+      dn.x = this.drag.tx;
+      dn.y = this.drag.ty;
+      dn.vx = 0;
+      dn.vy = 0;
     }
 
     ctx.save();
@@ -1087,18 +1221,24 @@ class DynamicGraphsView extends ItemView {
     ctx.textAlign = 'center';
     const textCol = this.css('--text-normal', '#eee');
     for (const n of active) {
-      const appear = smoothstep(n.date, n.date + this.range * 0.015, this.t);
+      const appear = smoothstep(n.date - fade, n.date, this.t);
       const r = (n.isGroup ? 9 : 5) * (0.4 + 0.6 * appear);
       ctx.globalAlpha = appear;
       ctx.fillStyle = this.colorOf(n);
       ctx.beginPath();
       ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
       ctx.fill();
-      // Label every node; hubs above (full size), notes below (one step down).
-      ctx.font = n.isGroup ? this.graphFont() : this.graphFont(-1);
-      ctx.fillStyle = textCol;
-      const dy = n.isGroup ? -r - 4 : r + this.plugin.settings.graphFontSize;
-      ctx.fillText(n.title, n.x, n.y + dy);
+      // Label nodes; hubs above (full size), notes below (one step down).
+      const showLabel = n.isGroup
+        ? this.plugin.settings.showGroupLabels
+        : this.plugin.settings.showNodeLabels;
+      if (showLabel) {
+        ctx.font = n.isGroup ? this.groupFont() : this.nodeFont();
+        ctx.fillStyle = textCol;
+        const sz = n.isGroup ? this.plugin.settings.groupFontSize : this.plugin.settings.nodeFontSize;
+        const dy = n.isGroup ? -r - 4 : r + sz;
+        ctx.fillText(n.title, n.x, n.y + dy);
+      }
     }
     ctx.globalAlpha = 1;
     ctx.restore();
@@ -1197,10 +1337,72 @@ class DynamicGraphsView extends ItemView {
     return best;
   }
 
-  onMouseMove(e) {
+  pickTimelineNode(mx, my) {
+    if (!this._timelineHits) return null;
+    let best = null;
+    let bestD = 12 * 12;
+    for (const h of this._timelineHits) {
+      const dx = h.x - mx, dy = h.y - my;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bestD) {
+        bestD = d2;
+        best = h.node;
+      }
+    }
+    return best;
+  }
+
+  pickNode(mx, my) {
+    if (this.mode === 'graph') return this.pickGraphNode(mx, my);
+    if (this.mode === 'timeline') return this.pickTimelineNode(mx, my);
+    return null;
+  }
+
+  localPoint(e) {
     const rect = this.canvas.getBoundingClientRect();
-    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-    const node = this.pickGraphNode(mx, my);
+    return { mx: e.clientX - rect.left, my: e.clientY - rect.top };
+  }
+
+  onMouseDown(e) {
+    if (e.button !== 0) return;
+    const { mx, my } = this.localPoint(e);
+    const node = this.pickNode(mx, my);
+    if (!node) {
+      this.drag = null;
+      return;
+    }
+    if (this.mode === 'graph' && this._graphOffset) {
+      const { cx, cy } = this._graphOffset;
+      const lx = mx - cx, ly = my - cy;
+      this.drag = { node, mode: 'graph', sx: mx, sy: my, ox: node.x - lx, oy: node.y - ly, tx: node.x, ty: node.y, moved: false };
+    } else {
+      // Timeline: press to click-open; no dragging.
+      this.drag = { node, mode: this.mode, sx: mx, sy: my, moved: false };
+    }
+  }
+
+  onMouseMove(e) {
+    const { mx, my } = this.localPoint(e);
+
+    // Graph node drag: pin to cursor.
+    if (this.drag && this.drag.mode === 'graph' && this._graphOffset) {
+      const { cx, cy } = this._graphOffset;
+      this.drag.tx = mx - cx + this.drag.ox;
+      this.drag.ty = my - cy + this.drag.oy;
+      if (!this.drag.moved && Math.hypot(mx - this.drag.sx, my - this.drag.sy) > 4) {
+        this.drag.moved = true;
+      }
+      this.tooltip.style.display = 'none';
+      this.canvas.style.cursor = 'grabbing';
+      return;
+    }
+    // Track movement so a moved press isn't treated as a click.
+    if (this.drag && !this.drag.moved && Math.hypot(mx - this.drag.sx, my - this.drag.sy) > 4) {
+      this.drag.moved = true;
+    }
+
+    // Hover tooltip (graph + timeline).
+    const node = this.pickNode(mx, my);
     if (node) {
       this.tooltip.style.display = 'block';
       this.tooltip.style.left = mx + 12 + 'px';
@@ -1213,11 +1415,13 @@ class DynamicGraphsView extends ItemView {
     }
   }
 
-  onClick(e) {
-    const rect = this.canvas.getBoundingClientRect();
-    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-    const node = this.pickGraphNode(mx, my);
-    if (node && node.file) {
+  onMouseUp() {
+    if (!this.drag) return;
+    const wasClick = !this.drag.moved;
+    const node = this.drag.node;
+    this.drag = null;
+    // A press without movement is a click → open the note.
+    if (wasClick && node && node.file) {
       this.plugin.app.workspace.getLeaf(false).openFile(node.file);
     }
   }

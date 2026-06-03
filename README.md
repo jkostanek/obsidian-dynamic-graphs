@@ -11,9 +11,13 @@ notes over time. No npm, no build — just `main.js` + `manifest.json`.
   Hover for a title, click to open the note. Optional group "hub" nodes.
 - **Cumulative line** — running count of notes vs time.
 
-The toolbar holds the live controls: mode, play/pause, restart, scrubber, a
-slow↔fast speed slider (2–15 s per sweep), two font-size inputs (**label** = axis,
-chart & tooltip; **node** = graph node labels; both 8–32), reload, and the gear (⚙).
+The toolbar groups the live controls:
+
+- **Playback** — mode, restart, play/pause, scrubber, date, and a slow↔fast speed
+  slider (2–15 s per sweep).
+- **Graph** — group color scheme, plus a **nodes** box and a **groups** box, each
+  with a show/hide toggle and a label-size slider (8–32).
+- Trailing: a **text** slider (axis/chart/tooltip size), reload (⟳), and the gear (⚙).
 
 ## Settings (gear)
 
