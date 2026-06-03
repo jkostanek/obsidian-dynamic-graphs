@@ -32,6 +32,7 @@ const DEFAULT_SETTINGS = {
   yearProp: 'year', // year property (e.g. publication year)
   timeAxis: 'date', // 'date' (use dateProp) | 'year' (use yearProp)
   labelProp: 'short_title', // node label; falls back to file basename
+  hoverProp: '', // frontmatter key for hover-tooltip text (e.g. full title); '' = label
   groupSource: 'property', // 'tags' (Obsidian tags) | 'property' (a frontmatter list)
   groupProp: 'buckets', // frontmatter property used when groupSource === 'property'
   folderScope: '', // '' = whole vault; otherwise limit to this folder
@@ -284,6 +285,16 @@ class DynamicGraphsSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName('Hover text property')
+      .setDesc('Frontmatter key shown in the hover tooltip (e.g. a full title). Falls back to the label.')
+      .addText((t) =>
+        t.setPlaceholder('(label)').setValue(s.hoverProp).onChange((v) => {
+          s.hoverProp = v.trim();
+          save(true);
+        })
+      );
+
+    new Setting(containerEl)
       .setName('Group by')
       .setDesc('What drives grouping and color across all four modes.')
       .addDropdown((d) => {
@@ -387,6 +398,20 @@ class DynamicGraphsView extends ItemView {
   }
   getIcon() {
     return 'line-chart';
+  }
+
+  // Serialize state so the view can be restored (workspace reload, bookmarks).
+  getState() {
+    return { mode: this.mode };
+  }
+
+  async setState(state, result) {
+    await super.setState(state, result);
+    if (state && MODES.some((m) => m.id === state.mode)) {
+      this.mode = state.mode;
+      if (this.modeSel) this.modeSel.value = this.mode;
+      this.applyModeVisibility();
+    }
   }
 
   async onOpen() {
@@ -637,7 +662,7 @@ class DynamicGraphsView extends ItemView {
 
     const axisWrap = graph.createDiv();
     Object.assign(axisWrap.style, { display: 'flex', alignItems: 'center', gap: '4px' });
-    axisWrap.createEl('span', { text: 'x-axis' }).style.color = 'var(--text-muted)';
+    axisWrap.createEl('span', { text: 'time axis' }).style.color = 'var(--text-muted)';
     const axisSel = axisWrap.createEl('select');
     axisSel.addClass('dropdown');
     const optDate = axisSel.createEl('option', { text: 'Date' });
@@ -651,7 +676,7 @@ class DynamicGraphsView extends ItemView {
       this.plugin.saveSettings(true);
     };
     this.axisSel = axisSel;
-    showIn(axisWrap, ['timeline', 'cumulative'], 'flex');
+    showIn(axisWrap, ['timeline', 'groups', 'graph', 'cumulative'], 'flex');
 
     // --- trailing utility (top row, right) ---
     const util = bar.createDiv();
@@ -779,11 +804,14 @@ class DynamicGraphsView extends ItemView {
       for (const g of groups) groupSet.add(g);
 
       const labelVal = s.labelProp && fm[s.labelProp];
+      const label = (labelVal && String(labelVal)) || f.basename;
+      const hoverVal = s.hoverProp && fm[s.hoverProp];
       idx.set(f.path, fileNodes.length);
       fileNodes.push({
         id: f.path,
         file: f,
-        title: (labelVal && String(labelVal)) || f.basename,
+        title: label,
+        hover: (hoverVal && String(hoverVal)) || label,
         year,
         date,
         groups,
@@ -1161,6 +1189,8 @@ class DynamicGraphsView extends ItemView {
     const activeEdges = data.edges.filter((e) => activeSet.has(e.s) && activeSet.has(e.t));
 
     const k = 0.02, rep = 1800, center = 0.012, damp = 0.88;
+    // Safeguards against runaway physics on load / overlap / state changes.
+    const MAXF = 40, MAXV = 40, BOUND = 4000;
     for (let i = 0; i < active.length; i++) {
       const a = active[i];
       for (let j = i + 1; j < active.length; j++) {
@@ -1168,8 +1198,9 @@ class DynamicGraphsView extends ItemView {
         let dx = a.x - b.x, dy = a.y - b.y;
         let d2 = dx * dx + dy * dy;
         if (d2 < 1) d2 = 1;
-        const f = rep / d2;
         const d = Math.sqrt(d2);
+        let f = rep / d2;
+        if (f > MAXF) f = MAXF; // cap repulsion when nodes overlap
         const fx = (dx / d) * f, fy = (dy / d) * f;
         a.vx += fx; a.vy += fy;
         b.vx -= fx; b.vy -= fy;
@@ -1180,7 +1211,8 @@ class DynamicGraphsView extends ItemView {
       const b = data.nodes[data.idx.get(e.t)];
       const dx = b.x - a.x, dy = b.y - a.y;
       const d = Math.sqrt(dx * dx + dy * dy) || 1;
-      const f = (d - 85) * k;
+      let f = (d - 85) * k;
+      if (f > MAXF) f = MAXF; else if (f < -MAXF) f = -MAXF;
       const fx = (dx / d) * f, fy = (dy / d) * f;
       a.vx += fx; a.vy += fy;
       b.vx -= fx; b.vy -= fy;
@@ -1190,8 +1222,12 @@ class DynamicGraphsView extends ItemView {
       a.vy += -a.y * center;
       a.vx *= damp;
       a.vy *= damp;
+      const sp = Math.hypot(a.vx, a.vy);
+      if (sp > MAXV) { const s = MAXV / sp; a.vx *= s; a.vy *= s; } // clamp speed
       a.x += a.vx;
       a.y += a.vy;
+      if (!isFinite(a.x) || !isFinite(a.y)) { a.x = 0; a.y = 0; a.vx = 0; a.vy = 0; }
+      else { a.x = clamp(a.x, -BOUND, BOUND); a.y = clamp(a.y, -BOUND, BOUND); }
     }
 
     // Pin the dragged node to the cursor so the network flows around it.
@@ -1407,7 +1443,7 @@ class DynamicGraphsView extends ItemView {
       this.tooltip.style.display = 'block';
       this.tooltip.style.left = mx + 12 + 'px';
       this.tooltip.style.top = my + 12 + 'px';
-      this.tooltip.setText(node.title + (node.year ? ` (${node.year})` : ''));
+      this.tooltip.setText((node.hover || node.title) + (node.year ? ` (${node.year})` : ''));
       this.canvas.style.cursor = node.file ? 'pointer' : 'default';
     } else {
       this.tooltip.style.display = 'none';

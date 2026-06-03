@@ -30,8 +30,12 @@ Everything below is configurable; defaults in parentheses.
   Accepts any `Date.parse`-able string or a Date.
 - **Year property** — year metadata, e.g. publication year, mapped to Jan 1 (`year`).
 - **Timeline x-axis** — position notes by the `Date property` or the `Year property`
-  (the other is the fallback when the chosen one is missing).
+  (the other is the fallback when the chosen one is missing). Also a toolbar
+  **time axis** control; it drives the animation in every mode, not just the ones
+  with a literal time axis.
 - **Label property** — node label; falls back to the file name (`short_title`).
+- **Hover text property** — frontmatter key shown in the hover tooltip, e.g. a full
+  title; falls back to the label. (Hover works in graph and timeline modes.)
 - **Group by** — `Obsidian tags` or a `Frontmatter property` (default: property
   named `buckets`). Drives grouping and color in every mode.
 - **Folder scope** — limit to a folder, or blank for the whole vault.
